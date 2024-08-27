@@ -1,3 +1,4 @@
 .env
 /files/
 user_data.json
+/myenv/
