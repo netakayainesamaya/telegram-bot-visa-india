@@ -12,11 +12,17 @@ from datetime import datetime
 from aiogram.fsm.middleware import BaseMiddleware
 from aiogram.filters import Command, StateFilter
 from dotenv import load_dotenv
-from flask import Flask
+from flask import Flask, request
+from threading import Thread
 import asyncio
-import datetime
+import signal
+import requests
+import sys
 
 load_dotenv()  # Загрузка переменных из файла .env
+
+# Создаем событие для завершения работы Flask-сервера
+shutdown_event = asyncio.Event()
 
 app = Flask(__name__)
 
@@ -24,9 +30,13 @@ app = Flask(__name__)
 def hello():
     return "Bot is running"
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+# @app.route('/shutdown', methods=['POST'])
+# def shutdown():
+#     func = request.environ.get('werkzeug.server.shutdown')
+#     if func is None:
+#         raise RuntimeError('Not running with the Werkzeug Server')
+#     func()
+#     return 'Shutting down...'
 
 # Bot token
 API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
@@ -42,6 +52,19 @@ bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 router = Router()
 dp = Dispatcher(storage=storage)
+
+# Функция для завершения работы
+async def shutdown():
+    print("Shutting down...")
+    try:
+        # Попробуем корректно завершить поллинг
+        await dp.stop_polling()
+    except RuntimeError as e:
+        if str(e) == "Polling is not started":
+            print("Polling was already stopped.")
+    # Закрытие сессии бота
+    await bot.session.close()
+    print("Shutdown complete.")
 
 # Defining bot states (numbered according to the steps/questions)
 class VisaForm(StatesGroup):
@@ -1361,11 +1384,44 @@ async def invalid_passport_2_upload(message: types.Message):
 
     await message.answer("Пожалуйста, отправьте фото или скан копию второго паспорта в формате изображения или документа.")
 
-# Start the bot
+# Flask-приложение для Render
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+
+@app.route('/shutdown_flask', methods=['POST'])
+def shutdown_flask():
+    print("Flask server shutting down...")
+    # Не вызываем shutdown через werkzeug
+    return 'Flask server shutting down...'
+
+# Асинхронная функция для старта бота
 async def main():
-    dp.include_router(router)
-    await dp.start_polling(bot)
+    dp.include_router(router)  # Используем твою структуру
+    try:
+        await dp.start_polling(bot)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await shutdown()  # Корректное завершение работы
+
+# Функция для запуска бота и сервера
+def run():
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True  # Указываем, что это демон-поток
+    flask_thread.start()
+
+    loop = asyncio.get_event_loop()
+    task = loop.create_task(main())
+
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        print("KeyboardInterrupt received, shutting down...")
+        task.cancel()  # Отменить задачу поллинга
+        loop.run_until_complete(shutdown())  # Запуск shutdown
+        print("Shutdown complete.")
+        # Явно завершаем программу
+        sys.exit(0)
 
 if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
+    run()
