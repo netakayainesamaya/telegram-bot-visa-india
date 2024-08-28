@@ -28,6 +28,12 @@ load_dotenv()
 # Логирование
 logging.basicConfig(level=logging.DEBUG)
 
+# Bot token
+API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
+
+# Group ID for forwarding messages
+GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID'))  # replace your chat_id
+
 # Initializing the bot, router for handling commands, and dispatcher
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
@@ -54,11 +60,6 @@ async def on_startup():
     webhook_url = f"https://{os.getenv('WEBHOOK_DOMAIN')}/{os.getenv('BOT_TOKEN')}"
     await bot.set_webhook(webhook_url)
 
-# Bot token
-API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
-
-# Group ID for forwarding messages
-GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID'))  # replace your chat_id
 
 # Logging setup
 # logging.basicConfig(level=logging.DEBUG)
