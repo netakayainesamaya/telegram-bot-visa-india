@@ -13,30 +13,46 @@ from aiogram.fsm.middleware import BaseMiddleware
 from aiogram.filters import Command, StateFilter
 from dotenv import load_dotenv
 from flask import Flask, request
-from threading import Thread
-import asyncio
+# from threading import Thread
 import signal
-import requests
 import sys
+import asyncio
+import datetime
 
-load_dotenv()  # Загрузка переменных из файла .env
+# Загрузка переменных из .env файла
+load_dotenv()
 
 # Создаем событие для завершения работы Flask-сервера
-shutdown_event = asyncio.Event()
+# shutdown_event = asyncio.Event()
 
+# Логирование
+logging.basicConfig(level=logging.DEBUG)
+
+# Initializing the bot, router for handling commands, and dispatcher
+bot = Bot(token=API_TOKEN)
+storage = MemoryStorage()
+router = Router()
+dp = Dispatcher(storage=storage)
+
+# Flask-приложение
 app = Flask(__name__)
 
+# Flask-приложение для Render
 @app.route('/')
 def hello():
     return "Bot is running"
 
-# @app.route('/shutdown', methods=['POST'])
-# def shutdown():
-#     func = request.environ.get('werkzeug.server.shutdown')
-#     if func is None:
-#         raise RuntimeError('Not running with the Werkzeug Server')
-#     func()
-#     return 'Shutting down...'
+# Вебхук для обработки обновлений от Telegram
+@app.route(f'/{os.getenv("BOT_TOKEN")}', methods=['POST'])
+async def handle_update():
+    update = types.Update(**request.get_json())
+    await dp.process_update(update)
+    return "OK"
+
+# Функция установки вебхука
+async def on_startup():
+    webhook_url = f"https://{os.getenv('WEBHOOK_DOMAIN')}/{os.getenv('BOT_TOKEN')}"
+    await bot.set_webhook(webhook_url)
 
 # Bot token
 API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
@@ -45,23 +61,13 @@ API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID'))  # replace your chat_id
 
 # Logging setup
-logging.basicConfig(level=logging.INFO)
+# logging.basicConfig(level=logging.DEBUG)
 
-# Initializing the bot, router for handling commands, and dispatcher
-bot = Bot(token=API_TOKEN)
-storage = MemoryStorage()
-router = Router()
-dp = Dispatcher(storage=storage)
+
 
 # Функция для завершения работы
 async def shutdown():
     print("Shutting down...")
-    try:
-        # Попробуем корректно завершить поллинг
-        await dp.stop_polling()
-    except RuntimeError as e:
-        if str(e) == "Polling is not started":
-            print("Polling was already stopped.")
     # Закрытие сессии бота
     await bot.session.close()
     print("Shutdown complete.")
@@ -1385,43 +1391,53 @@ async def invalid_passport_2_upload(message: types.Message):
     await message.answer("Пожалуйста, отправьте фото или скан копию второго паспорта в формате изображения или документа.")
 
 # Flask-приложение для Render
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
+# def run_flask():
+#     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 
-@app.route('/shutdown_flask', methods=['POST'])
-def shutdown_flask():
-    print("Flask server shutting down...")
-    # Не вызываем shutdown через werkzeug
-    return 'Flask server shutting down...'
+# @app.route('/shutdown_flask', methods=['POST'])
+# def shutdown_flask():
+#     print("Flask server shutting down...")
+#     # Не вызываем shutdown через werkzeug
+#     return 'Flask server shutting down...'
 
 # Асинхронная функция для старта бота
 async def main():
-    dp.include_router(router)  # Используем твою структуру
-    try:
-        await dp.start_polling(bot)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await shutdown()  # Корректное завершение работы
+    dp.include_router(router)  # Включаем ваши маршруты
+    await on_startup()  # Устанавливаем вебхук
+
+# Установка вебхука
+# async def on_startup():
+#     webhook_url = f"https://{os.getenv('WEBHOOK_DOMAIN')}/{os.getenv('BOT_TOKEN')}"
+#     await bot.set_webhook(webhook_url)
+#     print(f"Webhook установлен: {webhook_url}")
+
+# # Flask-приложение для обработки вебхуков
+# @app.route(f"/{os.getenv('BOT_TOKEN')}", methods=['POST'])
+# async def process_webhook():
+#     update = types.Update(**await request.get_json())
+#     await dp.process_update(update)
+#     return "!", 200
 
 # Функция для запуска бота и сервера
-def run():
-    flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True  # Указываем, что это демон-поток
-    flask_thread.start()
+# def run():
+#     flask_thread = Thread(target=run_flask)
+#     flask_thread.daemon = True  # Указываем, что это демон-поток
+#     flask_thread.start()
 
-    loop = asyncio.get_event_loop()
-    task = loop.create_task(main())
+#     loop = asyncio.get_event_loop()
+#     task = loop.create_task(main())
 
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt received, shutting down...")
-        task.cancel()  # Отменить задачу поллинга
-        loop.run_until_complete(shutdown())  # Запуск shutdown
-        print("Shutdown complete.")
-        # Явно завершаем программу
-        sys.exit(0)
+#     try:
+#         loop.run_forever()
+#     except KeyboardInterrupt:
+#         print("KeyboardInterrupt received, shutting down...")
+#         task.cancel()
+#         loop.run_until_complete(shutdown())
+#         print("Shutdown complete.")
+#         sys.exit(0)
+
+# if __name__ == '__main__':
+#     run()
 
 if __name__ == '__main__':
-    run()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
