@@ -12,10 +12,21 @@ from datetime import datetime
 from aiogram.fsm.middleware import BaseMiddleware
 from aiogram.filters import Command, StateFilter
 from dotenv import load_dotenv
+from flask import Flask
 import asyncio
 import datetime
 
 load_dotenv()  # Загрузка переменных из файла .env
+
+app = Flask(__name__)
+
+@app.route('/')
+def hello():
+    return "Bot is running"
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 # Bot token
 API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
