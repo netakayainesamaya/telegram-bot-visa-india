@@ -1,4 +1,9 @@
-.env
 /files/
-user_data.json
 /myenv/
+.env
+bot.log
+gcloud.bat
+ngrok.exe
+Procfile
+user_data.json
+visa-india-bot-firebase-adminsdk-akts3-25576a4b17.json

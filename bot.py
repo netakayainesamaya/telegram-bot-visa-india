@@ -1,6 +1,8 @@
 import json
 import os
 import logging
+import time
+import io
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -11,28 +13,123 @@ from aiogram_calendar import SimpleCalendar, SimpleCalendarCallback
 from datetime import datetime
 from aiogram.fsm.middleware import BaseMiddleware
 from aiogram.filters import Command, StateFilter
-from dotenv import load_dotenv
 from flask import Flask, request
-# from threading import Thread
-import signal
-import sys
+from dotenv import load_dotenv
 import asyncio
-import datetime
+from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, firestore, storage as firebase_storage
+
+import uuid  # Добавляем импорт библиотеки uuid
+from aiogram import BaseMiddleware
+from aiogram.types import Message
+from aiogram.exceptions import TelegramForbiddenError
 
 # Загрузка переменных из .env файла
 load_dotenv()
 
-# Создаем событие для завершения работы Flask-сервера
-# shutdown_event = asyncio.Event()
-
 # Логирование
-logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,  # Уровень логирования (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Формат сообщений лога
+    handlers=[
+        logging.FileHandler("bot.log"),  # Запись логов в файл bot.log
+        logging.StreamHandler()  # Вывод логов в консоль
+    ]
+)
+
+class LoggingMiddleware(BaseMiddleware):
+
+    async def __call__(self, handler, event, data):
+        user_id = event.from_user.id if isinstance(event, Message) else None
+        try:
+            # Логирование входящих сообщений
+            if isinstance(event, Message):
+                logging.info(f"Received message from user {user_id}: {event.text}")
+            
+            # Выполнение обработчика
+            return await handler(event, data)
+        
+        except TelegramForbiddenError:
+            logging.warning(f"Bot was blocked by user {user_id}")
+            # Вы можете обработать это исключение или просто игнорировать его
+            return
+        
+        except Exception as e:
+            logging.error(f"Error occurred for user {user_id}: {str(e)}")
+            raise e  # Пробрасываем исключение дальше после логирования
 
 # Bot token
 API_TOKEN = os.getenv('BOT_TOKEN')  # Insert token from @BotFather here
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 
 # Group ID for forwarding messages
 GROUP_CHAT_ID = int(os.getenv('GROUP_CHAT_ID'))  # replace your chat_id
+
+# Замените 'path_to_your_service_account_key.json' на путь к вашему файлу JSON с учетными данными
+# cred = credentials.Certificate('visa-india-bot-firebase-adminsdk-akts3-25576a4b17.json')
+# firebase_admin.initialize_app(cred, {
+#     'storageBucket': 'visa-india-bot.appspot.com'  # Ваш ID проекта
+# })
+
+# Инициализация Firebase с использованием переменных окружения
+cred = credentials.Certificate({
+    "type": os.getenv('FIREBASE_TYPE'),
+    "project_id": os.getenv('FIREBASE_PROJECT_ID'),
+    "private_key_id": os.getenv('FIREBASE_PRIVATE_KEY_ID'),
+    "private_key": os.getenv('FIREBASE_PRIVATE_KEY').replace('\\n', '\n'),
+    "client_email": os.getenv('FIREBASE_CLIENT_EMAIL'),
+    "client_id": os.getenv('FIREBASE_CLIENT_ID'),
+    "auth_uri": os.getenv('FIREBASE_AUTH_URI'),
+    "token_uri": os.getenv('FIREBASE_TOKEN_URI'),
+    "auth_provider_x509_cert_url": os.getenv('FIREBASE_AUTH_PROVIDER_X509_CERT_URL'),
+    "client_x509_cert_url": os.getenv('FIREBASE_CLIENT_X509_CERT_URL')
+})
+
+firebase_admin.initialize_app(cred, {
+    'storageBucket': os.getenv('FIREBASE_STORAGE_BUCKET')  # Ваш ID проекта
+})
+
+# Функция для загрузки файлов в Firebase Storage (поддерживает изображения и PDF)
+def upload_file_to_firebase(file_data, file_name, content_type):
+    try:
+        bucket = firebase_storage.bucket()
+        blob = bucket.blob(file_name)
+        
+        # Устанавливаем Content-Disposition
+        blob.content_disposition = f'inline; filename*=utf-8\'\'{file_name}'
+
+        # Читаем все содержимое BytesIO как строку байтов
+        file_data_content = file_data.read()
+        logging.info(f"File size: {len(file_data_content)} bytes")
+        
+        # Загружаем файл в Firebase Storage
+        blob.upload_from_string(file_data_content, content_type=content_type)
+        
+        # Генерация и добавление токена для скачивания
+        token = uuid.uuid4()
+        blob.metadata = {"firebaseStorageDownloadTokens": str(token)}
+        blob.patch()  # Применяем изменения к метаданным
+        
+        # Делаем файл публичным
+        blob.make_public()
+        
+        return blob.public_url
+    except Exception as e:
+        logging.error(f"Error during file upload: {str(e)}")
+        return None
+
+# Инициализация клиента Firestore
+db = firestore.client()
+
+# Тестовое подключение к Firestore
+try:
+    doc_ref = db.collection('test').document('test_doc')
+    doc_ref.set({'status': 'connected'})
+    logging.info("Successfully connected to Firestore and added test document.")
+except Exception as e:
+    logging.error(f"Error connecting to Firestore: {e}")
 
 # Initializing the bot, router for handling commands, and dispatcher
 bot = Bot(token=API_TOKEN)
@@ -40,38 +137,52 @@ storage = MemoryStorage()
 router = Router()
 dp = Dispatcher(storage=storage)
 
+# Добавляем middleware в диспетчер
+dp.message.middleware(LoggingMiddleware())
+dp.callback_query.middleware(LoggingMiddleware())
+
 # Flask-приложение
 app = Flask(__name__)
 
-# Flask-приложение для Render
-@app.route('/')
-def hello():
-    return "Bot is running"
+# Маршрут для проверки работы приложения
+@app.route('/', methods=['GET'])
+def index():
+    return "Bot is running!", 200
 
 # Вебхук для обработки обновлений от Telegram
-@app.route(f'/{os.getenv("BOT_TOKEN")}', methods=['POST'])
+@app.route(f'/{API_TOKEN}', methods=['POST'])
 async def handle_update():
-    update = types.Update(**request.get_json())
-    await dp.process_update(update)
-    return "OK"
+    start_time = time.time()  # Начало измерения времени
+    json_update = request.get_json()
+    update = types.Update(**json_update)
+    await dp.feed_update(bot, update)
+    end_time = time.time()  # Конец измерения времени
+    logging.info(f"Update processed in {end_time - start_time} seconds")
+    return 'OK'
 
 # Функция установки вебхука
-async def on_startup():
-    webhook_url = f"https://{os.getenv('WEBHOOK_DOMAIN')}/{os.getenv('BOT_TOKEN')}"
+async def set_webhook():
+    webhook_url = f"{WEBHOOK_URL}/{API_TOKEN}"
     await bot.set_webhook(webhook_url)
+    logging.info(f"Вебхук установлен на URL: {webhook_url}")
 
+# Функция для запуска бота и сервера
+async def main():
+    dp.include_router(router)
+    await set_webhook()
 
-# Logging setup
-# logging.basicConfig(level=logging.DEBUG)
+    # Конвертация Flask в ASGI приложение
+    from asgiref.wsgi import WsgiToAsgi
+    asgi_app = WsgiToAsgi(app)
 
+    # Настройка и запуск ASGI сервера
+    from hypercorn.asyncio import serve
+    from hypercorn.config import Config
 
+    config = Config()
+    config.bind = ["0.0.0.0:5000"]
 
-# Функция для завершения работы
-async def shutdown():
-    print("Shutting down...")
-    # Закрытие сессии бота
-    await bot.session.close()
-    print("Shutdown complete.")
+    await serve(asgi_app, config)
 
 # Defining bot states (numbered according to the steps/questions)
 class VisaForm(StatesGroup):
@@ -124,25 +235,27 @@ class VisaForm(StatesGroup):
 
 # Function to save user data to a JSON file
 def save_user_data(user_id, data):
-    if os.path.exists('user_data.json'):
-        with open('user_data.json', 'r', encoding='utf-8') as file:
-            users = json.load(file)
-    else:
-        users = {}
-
-    users[str(user_id)] = data
-
-    with open('user_data.json', 'w', encoding='utf-8') as file:
-        json.dump(users, file, indent=4, ensure_ascii=False)
+    try:
+        doc_ref = db.collection('users').document(str(user_id))
+        doc_ref.set(data, merge=True)
+        logging.info(f"Data for user {user_id} saved to Firestore.")
+    except Exception as e:
+        logging.error(f"Error saving data to Firestore for user {user_id}: {e}")
 
 # Function to get user data from a JSON file
 def get_user_data(user_id):
-    if os.path.exists('user_data.json'):
-        with open('user_data.json', 'r', encoding='utf-8') as file:
-            users = json.load(file)
-            return users.get(str(user_id), {})
-    return {}
-
+    try:
+        doc_ref = db.collection('users').document(str(user_id))
+        doc = doc_ref.get()
+        if doc.exists:
+            logging.info(f"Data for user {user_id} retrieved from Firestore.")
+            return doc.to_dict()
+        else:
+            logging.info(f"No data found for user {user_id} in Firestore.")
+            return {}
+    except Exception as e:
+        logging.error(f"Error retrieving data from Firestore for user {user_id}: {e}")
+        return {}
 
 # Function for forwarding messages to a group if the user sent a text instead of the desired response
 async def forward_message_to_group(user_message: types.Message, expected_answer_type: str):
@@ -157,16 +270,16 @@ async def forward_message_to_group(user_message: types.Message, expected_answer_
 #1. Welcome and button operation
 
 # 1.1 Welcome message and operation of the “Start survey” and “Contact support” buttons
+# Обработчик команды /start
 @dp.message(F.text == "/start")
 async def start_command(message: types.Message, state: FSMContext):
-    # Welcome message
+    await state.clear()  # Сбрасываем любое предыдущее состояние
     user_name = message.from_user.first_name
     welcome_text = (f"Добро пожаловать, {user_name} 👋\n"
                     "Я бот 🤖 - \"VisaApplicationBot\" 🇮🇳\n"
                     "Вместе мы сформируем твою заявку на получение визы в Индию 🤝\n"
                     "Начать опрос или связаться с поддержкой можно по кнопкам ниже 👇")
     
-    # Buttons "Start survey" and "Contact support"
     markup = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Начать опрос")],
@@ -176,7 +289,33 @@ async def start_command(message: types.Message, state: FSMContext):
     )
 
     await message.answer(welcome_text, reply_markup=markup)
-    await state.set_state("main_menu")  # Go to main menu
+    await state.set_state("main_menu")  # Устанавливаем состояние "main_menu"
+
+
+# Обработчик команды /help
+@dp.message(F.text == "/help")
+async def help_command(message: types.Message):
+    support_contact = "@netakayia"
+    await message.answer(f"Для получения помощи, свяжитесь с поддержкой: {support_contact}")
+
+
+# Обработчик команды /about
+@dp.message(F.text == "/about")
+async def about_command(message: types.Message):
+    about_text = (
+        "❤️ Добро пожаловать в мир удивительной Индии 🇮🇳, где Ваша безопасность и комфорт становятся для нас приоритетными 🙏\n\n"
+        "India.easy - Ваш надёжный партнёр во всех вопросах визовых услуг и консультаций по Индии 🇮🇳\n\n"
+        "Сделайте свой выбор в пользу комфорта и абсолютной уверенности в каждом шаге 🤗\n\n"
+        "Для более подробной информации пишите нам: *\n"
+        "✉️ @netakayia\n"
+        "🌍 @india_easy\n"
+        "💬 @india_easy_chat\n"
+        "💖 https://instagram.com/india.easy*"
+    )
+
+    photo = FSInputFile('main_about.jpg')  # Убедитесь, что путь к изображению правильный
+    await message.answer_photo(photo=photo, caption=about_text, parse_mode="Markdown")
+
 
 # 1.2 The user clicks on "Start survey"
 @dp.message(F.text == "Начать опрос", StateFilter("main_menu"))
@@ -205,7 +344,11 @@ async def contact_support(message: types.Message):
 # 1.4 If the user enters text before clicking "Start Survey" or "Contact Support"
 @dp.message(StateFilter("main_menu"))
 async def handle_message_before_start_survey(message: types.Message):
-    # We inform you that the user must click one of the buttons
+    # Проверка, не является ли сообщение командой
+    if message.text.startswith("/"):
+        return  # Если это команда, пропускаем обработчик
+
+    # Сообщение о необходимости выбрать одну из кнопок
     markup = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="Начать опрос")],
@@ -1100,7 +1243,7 @@ async def process_saarc_country_name(message: types.Message, state: FSMContext):
 
 # 27.2 Function to generate a keyboard with years
 def generate_year_keyboard():
-    current_year = datetime.datetime.now().year  # Current year
+    current_year = datetime.now().year  # Current year
     start_year = current_year - 20  # Show years starting from 20 years ago
 
     # List of buttons with years
@@ -1188,37 +1331,72 @@ async def send_sample_photo(message: types.Message):
     else:
         await message.answer("Образец фото не найден. Пожалуйста, проверьте путь к файлу.")
 
-# 29.2. Processing the uploaded photo
+# 29.2. Processing the uploaded photo or document
 @router.message(VisaForm.photo_upload, F.content_type.in_({"photo", "document"}))
 async def process_uploaded_photo(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    file_url = None  # Инициализация переменной для URL
 
-    # Create a folder with the user's ID
-    user_dir = f"files/{user_id}"
-    os.makedirs(user_dir, exist_ok=True)
-
-    if message.photo:  # If it's a photo
-        photo = message.photo[-1]  # Select the largest size photo
-        file_id = photo.file_id
-        file = await bot.get_file(file_id)
-        file_path = f'{user_dir}/photo.jpg'  # Save the photo as 'photo.jpg' in the user's folder
+    try:
+        if message.photo:  # Если это фото
+            photo = message.photo[-1]  # Выбираем самое большое по размеру фото
+            file_info = await bot.get_file(photo.file_id)  # Получаем информацию о файле
+            file_data = await bot.download_file(file_info.file_path)  # Загружаем файл в BytesIO
+            
+            # Имя файла и MIME-тип
+            file_name = f"user_{user_id}/photo.jpg"
+            content_type = 'image/jpeg'
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Фото успешно загружено.", reply_markup=ReplyKeyboardRemove())
         
-        await bot.download_file(file.file_path, file_path)
-        await message.answer("Спасибо! Фото успешно загружено.", reply_markup=ReplyKeyboardRemove())
-    
-    elif message.document and message.document.mime_type.startswith('image/'):  # If it's an image document
-        document = message.document
-        file_id = document.file_id
-        file = await bot.get_file(file_id)
-        file_path = f'{user_dir}/photo.jpg'  # Save the document as 'photo.jpg' in the user's folder
+        elif message.document and message.document.mime_type.startswith('image/'):  # Если это файл изображения
+            document = message.document
+            file_info = await bot.get_file(document.file_id)  # Получаем информацию о файле
+            file_data = await bot.download_file(file_info.file_path)  # Загружаем файл в BytesIO
+            
+            # Имя файла и MIME-тип
+            file_name = f"user_{user_id}/photo.jpg"
+            content_type = 'image/jpeg'
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Фото успешно загружено.", reply_markup=ReplyKeyboardRemove())
         
-        await bot.download_file(file.file_path, file_path)
-        await message.answer("Спасибо! Фото успешно загружено.", reply_markup=ReplyKeyboardRemove())
-    else:
-        await message.answer("Пожалуйста, отправьте фото в формате изображения.")
+        elif message.document and message.document.mime_type == 'application/pdf':  # Если это PDF
+            document = message.document
+            file_info = await bot.get_file(document.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            
+            # Имя файла и MIME-тип
+            file_name = f"user_{user_id}/photo.pdf"  # Изменяем имя файла для PDF
+            content_type = 'application/pdf'
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            
+            if file_url:
+                await message.answer("Спасибо! Документ (PDF) успешно загружен.", reply_markup=ReplyKeyboardRemove())
+            else:
+                await message.answer("Произошла ошибка при загрузке PDF-файла. Пожалуйста, попробуйте снова.")
+                return  # Остановка выполнения, если загрузка не удалась
 
-    # 30. Move to the next question
-    await ask_passport_photo(message, state)
+        else:
+            await message.answer("Пожалуйста, отправьте фото или документ в поддерживаемом формате.")
+            return  # Прерываем выполнение, если файл не поддерживается
+
+        # Сохранение URL файла в Firestore, если загрузка прошла успешно
+        if file_url:
+            doc_ref = db.collection('users').document(str(user_id))
+            doc_ref.update({"photo_url": file_url})
+
+        # Переход к следующему вопросу
+        await ask_passport_photo(message, state)
+
+    except Exception as e:
+        logging.error(f"Ошибка при обработке файла пользователя {user_id}: {e}")
+        await message.answer("Произошла ошибка при загрузке файла. Пожалуйста, попробуйте снова.")
 
 # 29.2. If the user sends text instead of a photo
 @router.message(VisaForm.photo_upload)
@@ -1258,35 +1436,60 @@ async def send_passport_sample(message: types.Message):
         await message.answer("Образец паспорта не найден. Пожалуйста, проверьте путь к файлу.")
 
 # 30.2. Processing the uploaded passport
-@router.message(VisaForm.passport_upload, F.document | F.photo)  # Use filter for photos and documents
+@router.message(VisaForm.passport_upload, F.document | F.photo)
 async def process_uploaded_passport(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    file_url = None  # Инициализация переменной
 
-    # Create a folder with the user's ID
-    user_dir = f"files/{user_id}"
-    os.makedirs(user_dir, exist_ok=True)
-
-    if message.document and message.document.mime_type == 'application/pdf':  # If a PDF is sent
-        document = message.document
-        file_id = document.file_id
-        file = await bot.get_file(file_id)
-        file_path = f'{user_dir}/passport.pdf'  # Save the document as 'passport.pdf' in the user's folder
+    try:
+        if message.document and message.document.mime_type == 'application/pdf':  # Если отправлен PDF
+            document = message.document
+            file_info = await bot.get_file(document.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            file_name = f"user_{user_id}/passport.pdf"  # Имя файла в Firebase Storage для PDF
+            content_type = 'application/pdf'  # Устанавливаем MIME-тип для PDF
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Паспорт (PDF) успешно загружен.", reply_markup=ReplyKeyboardRemove())
         
-        await bot.download_file(file.file_path, file_path)
-        await message.answer("Спасибо! Паспорт успешно загружен.")
-    elif message.photo:  # If a photo is sent
-        photo = message.photo[-1]  # Select the largest size photo
-        file_id = photo.file_id
-        file = await bot.get_file(file_id)
-        file_path = f'{user_dir}/passport.jpg'  # Save the photo as 'passport.jpg' in the user's folder
+        elif message.photo:  # Если отправлено фото
+            photo = message.photo[-1]
+            file_info = await bot.get_file(photo.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            file_name = f"user_{user_id}/passport.jpg"  # Имя файла в Firebase Storage для фото
+            content_type = 'image/jpeg'  # Устанавливаем MIME-тип для изображений
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Паспорт (фото) успешно загружен.", reply_markup=ReplyKeyboardRemove())
         
-        await bot.download_file(file.file_path, file_path)
-        await message.answer("Спасибо! Паспорт успешно загружен.")
-    else:
-        await message.answer("Пожалуйста, отправьте паспорт в формате PDF или фото.")
+        elif message.document and message.document.mime_type.startswith('image/'):  # Если отправлено изображение в документе
+            document = message.document
+            file_info = await bot.get_file(document.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            file_name = f"user_{user_id}/passport.jpg"  # Имя файла в Firebase Storage для изображения
+            content_type = 'image/jpeg'  # Устанавливаем MIME-тип для изображений
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Паспорт (изображение) успешно загружен.", reply_markup=ReplyKeyboardRemove())
+        
+        else:
+            await message.answer("Пожалуйста, отправьте паспорт в формате PDF или фото.")
+            return  # Прерываем выполнение, если файл не поддерживается
 
-    # 31. Move to the next question
-    await ask_additional_passport_question(message, state)
+        # Сохранение URL файла в Firestore, если загрузка прошла успешно
+        if file_url:
+            doc_ref = db.collection('users').document(str(user_id))
+            doc_ref.update({"passport_url": file_url})
+
+        # Переход к следующему вопросу
+        await ask_additional_passport_question(message, state)
+
+    except Exception as e:
+        logging.error(f"Ошибка при обработке паспорта пользователя {user_id}: {e}")
+        await message.answer("Произошла ошибка при загрузке файла. Пожалуйста, попробуйте снова.")
 
 # 30.2. If the user sends text instead of a passport document or photo
 @router.message(VisaForm.passport_upload)
@@ -1354,34 +1557,58 @@ async def ask_second_passport(message: types.Message, state: FSMContext):
 @router.message(VisaForm.passport_2_upload, F.content_type.in_({"photo", "document"}))
 async def process_second_passport(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
+    file_url = None  # Инициализация переменной
 
-    # Create a folder with the user's ID if it doesn't exist
-    user_dir = f"files/{user_id}"
-    os.makedirs(user_dir, exist_ok=True)
-
-    if message.photo:  # If it's a photo
-        photo = message.photo[-1]  # Select the largest size photo
-        file_id = photo.file_id
-        file = await bot.get_file(file_id)
-        file_path = f'{user_dir}/passport-2.jpg'  # Save the photo as 'passport-2.jpg' in the user's folder
+    try:
+        if message.photo:  # Если это фото
+            photo = message.photo[-1]
+            file_info = await bot.get_file(photo.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            file_name = f"user_{user_id}/passport-2.jpg"  # Имя файла в Firebase Storage для фото
+            content_type = 'image/jpeg'  # Устанавливаем MIME-тип для изображений
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Второй паспорт (фото) успешно загружен.", reply_markup=ReplyKeyboardRemove())
         
-        await bot.download_file(file.file_path, file_path)
-        await message.answer("Спасибо! Второй паспорт успешно загружен.")
-    
-    elif message.document and message.document.mime_type.startswith('image/'):  # If it's an image document
-        document = message.document
-        file_id = document.file_id
-        file = await bot.get_file(file_id)
-        file_path = f'{user_dir}/passport-2.jpg'  # Save the document as 'passport-2.jpg' in the user's folder
+        elif message.document and message.document.mime_type.startswith('image/'):  # Если это изображение в документе
+            document = message.document
+            file_info = await bot.get_file(document.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            file_name = f"user_{user_id}/passport-2.jpg"  # Имя файла в Firebase Storage для изображения
+            content_type = 'image/jpeg'  # Устанавливаем MIME-тип для изображений
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Второй паспорт (изображение) успешно загружен.", reply_markup=ReplyKeyboardRemove())
         
-        await bot.download_file(file.file_path, file_path)
-        await message.answer("Спасибо! Второй паспорт успешно загружен.")
-    else:
-        await message.answer("Пожалуйста, отправьте паспорт в формате изображения или документа.")
+        elif message.document and message.document.mime_type == 'application/pdf':  # Если это PDF документ
+            document = message.document
+            file_info = await bot.get_file(document.file_id)
+            file_data = await bot.download_file(file_info.file_path)
+            file_name = f"user_{user_id}/passport-2.pdf"  # Изменяем имя файла в Firebase Storage
+            content_type = 'application/pdf'  # Устанавливаем MIME-тип для PDF
+            
+            # Загрузка файла в Firebase Storage
+            file_url = upload_file_to_firebase(file_data, file_name, content_type)
+            await message.answer("Спасибо! Второй паспорт (PDF) успешно загружен.", reply_markup=ReplyKeyboardRemove())
+        
+        else:
+            await message.answer("Пожалуйста, отправьте паспорт в формате PDF или фото.")
+            return  # Прерываем выполнение, если файл не поддерживается
 
-    # Completion of the process
-    await message.answer("Ваши данные успешно записаны 🙂", reply_markup=ReplyKeyboardRemove())
-    await state.clear()  # Clear the state after completion
+        # Сохранение URL файла в Firestore, если загрузка прошла успешно
+        if file_url:
+            doc_ref = db.collection('users').document(str(user_id))
+            doc_ref.update({"passport_2_url": file_url})
+
+        # Завершение процесса
+        await message.answer("Ваши данные успешно записаны 🙂", reply_markup=ReplyKeyboardRemove())
+        await state.clear()
+
+    except Exception as e:
+        logging.error(f"Ошибка при обработке второго паспорта пользователя {user_id}: {e}")
+        await message.answer("Произошла ошибка при загрузке файла. Пожалуйста, попробуйте снова.")
 
 # 31.2 If the user sends text instead of the second passport
 @router.message(VisaForm.passport_2_upload)
@@ -1391,54 +1618,5 @@ async def invalid_passport_2_upload(message: types.Message):
 
     await message.answer("Пожалуйста, отправьте фото или скан копию второго паспорта в формате изображения или документа.")
 
-# Flask-приложение для Render
-# def run_flask():
-#     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
-
-# @app.route('/shutdown_flask', methods=['POST'])
-# def shutdown_flask():
-#     print("Flask server shutting down...")
-#     # Не вызываем shutdown через werkzeug
-#     return 'Flask server shutting down...'
-
-# Асинхронная функция для старта бота
-async def main():
-    dp.include_router(router)  # Включаем ваши маршруты
-    await on_startup()  # Устанавливаем вебхук
-
-# Установка вебхука
-# async def on_startup():
-#     webhook_url = f"https://{os.getenv('WEBHOOK_DOMAIN')}/{os.getenv('BOT_TOKEN')}"
-#     await bot.set_webhook(webhook_url)
-#     print(f"Webhook установлен: {webhook_url}")
-
-# # Flask-приложение для обработки вебхуков
-# @app.route(f"/{os.getenv('BOT_TOKEN')}", methods=['POST'])
-# async def process_webhook():
-#     update = types.Update(**await request.get_json())
-#     await dp.process_update(update)
-#     return "!", 200
-
-# Функция для запуска бота и сервера
-# def run():
-#     flask_thread = Thread(target=run_flask)
-#     flask_thread.daemon = True  # Указываем, что это демон-поток
-#     flask_thread.start()
-
-#     loop = asyncio.get_event_loop()
-#     task = loop.create_task(main())
-
-#     try:
-#         loop.run_forever()
-#     except KeyboardInterrupt:
-#         print("KeyboardInterrupt received, shutting down...")
-#         task.cancel()
-#         loop.run_until_complete(shutdown())
-#         print("Shutdown complete.")
-#         sys.exit(0)
-
-# if __name__ == '__main__':
-#     run()
-
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    asyncio.run(main())
