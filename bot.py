@@ -26,7 +26,7 @@ from aiogram.types import Message
 from aiogram.exceptions import TelegramForbiddenError
 
 # Загрузка переменных из .env файла
-load_dotenv()
+# load_dotenv()
 
 # Логирование
 # logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
